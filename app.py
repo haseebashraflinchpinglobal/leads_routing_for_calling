@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import secrets
@@ -38,6 +39,26 @@ events = Table('lp_events', metadata,
     Column('payload', Text, nullable=False))
 CAPTURE = {'SIGNUP', 'GOOGLE_SIGN_ON', 'CONTACT_INQUIRY', 'HOME_VALUE', 'PROPERTY_ACCESS', 'FORCED_LEAD_CAPTURE', 'NEWSLETTER_SIGNUP', 'EBOOK', 'REFERRAL'}
 HOSTS = {'spacematchinc.com', 'www.spacematchinc.com'}
+logger = logging.getLogger('spacematch.lp_webhook')
+logger.setLevel(os.getenv('LOG_LEVEL', 'INFO').upper())
+
+
+def log_webhook(level, event, **fields):
+    """Emit one Render-friendly structured line without payloads or secret values."""
+    getattr(logger, level)(
+        'lp_webhook %s',
+        json.dumps({'event': event, **fields}, separators=(',', ':'), sort_keys=True),
+    )
+
+
+def request_url_without_query(request):
+    # Query strings are not expected here and may contain sensitive data.
+    return str(request.url.replace(query=None, fragment=None))
+
+
+def reject_auth(reason, **fields):
+    log_webhook('warning', 'authentication_failed', reason=reason, **fields)
+    raise HTTPException(401, 'Invalid webhook authentication')
 
 @asynccontextmanager
 async def lifespan(app):
@@ -71,24 +92,83 @@ def health():
 
 @app.post('/webhooks/lp')
 async def receive(request: Request):
-    body = bytearray()
-    async for chunk in request.stream():
-        body.extend(chunk)
-        if len(body) > 1024 * 1024:
-            raise HTTPException(413, 'Payload too large')
-    body = bytes(body)
+    received_at = datetime.now(timezone.utc)
+    incoming_url = request_url_without_query(request)
+    body = await request.body()
+    if len(body) > 1024 * 1024:
+        log_webhook('warning', 'payload_rejected', reason='payload_too_large', body_length=len(body))
+        raise HTTPException(413, 'Payload too large')
     timestamp = request.headers.get('x-lp-timestamp', '')
     signature = request.headers.get('x-lp-signature', '')
     version = request.headers.get('x-lp-signature-version', '')
     delivery = request.headers.get('x-lp-delivery-id', '')
-    if version != 'v1' or not re.fullmatch(r'[0-9a-fA-F]{64}', signature) or not re.fullmatch(r'\d{13}', timestamp):
-        raise HTTPException(401, 'Invalid signature headers')
-    if abs(time.time() * 1000 - int(timestamp)) > 300_000:
-        raise HTTPException(401, 'Expired signature')
+    signature_is_hex = bool(re.fullmatch(r'[0-9a-fA-F]+', signature))
+    header_names = sorted({name.lower() for name in request.headers.keys()})
+    required_headers = ('x-lp-signature', 'x-lp-timestamp', 'x-lp-signature-version')
+    missing_headers = [name for name in required_headers if not request.headers.get(name)]
+    timestamp_has_valid_format = bool(re.fullmatch(r'[0-9]{1,16}', timestamp))
+    timestamp_ms = int(timestamp) if timestamp_has_valid_format else None
+    clock_difference_ms = round(time.time() * 1000 - timestamp_ms) if timestamp_ms is not None else None
+    common_diagnostics = {
+        'received_at': received_at.isoformat(),
+        'header_names': header_names,
+        'missing_signature_headers': missing_headers,
+        'signature_present': bool(signature),
+        'signature_length': len(signature),
+        'signature_format': 'hex' if signature_is_hex else ('absent' if not signature else 'non_hex'),
+        'signature_version': version or None,
+        'webhook_timestamp': timestamp or None,
+        'clock_difference_ms': clock_difference_ms,
+        'delivery_id_present': bool(delivery),
+        'delivery_id_length': len(delivery),
+        'body_length': len(body),
+        'configured_webhook_url': URL,
+        'incoming_request_url': incoming_url,
+        'webhook_url_matches_request': secrets.compare_digest(URL, incoming_url),
+        'signing_secret_present': bool(SECRET),
+        'signing_secret_length': len(SECRET),
+    }
+    log_webhook('info', 'request_received', **common_diagnostics)
+
+    if missing_headers:
+        reject_auth('missing_signature_headers', missing_headers=missing_headers)
+    if version != 'v1':
+        reject_auth('unsupported_signature_version', signature_version=version)
+    if not timestamp_has_valid_format:
+        reject_auth('invalid_timestamp_format', timestamp_length=len(timestamp))
+    if abs(clock_difference_ms) > 300_000:
+        reject_auth('expired_timestamp', clock_difference_ms=clock_difference_ms)
+    if len(signature) != 64:
+        reject_auth('invalid_signature_length', signature_length=len(signature))
+    if not signature_is_hex:
+        reject_auth('invalid_signature_encoding', signature_length=len(signature), signature_format='non_hex')
+
     expected = hmac.new(SECRET, timestamp.encode() + URL.encode() + body, hashlib.sha256).hexdigest()
     if not hmac.compare_digest(expected, signature.lower()):
-        raise HTTPException(401, 'Invalid signature')
+        # This does not relax verification. It only identifies a configured URL
+        # mismatch when the exact incoming URL validates the same signed bytes.
+        incoming_url_expected = hmac.new(
+            SECRET, timestamp.encode() + incoming_url.encode() + body, hashlib.sha256
+        ).hexdigest()
+        incoming_url_signature_matches = hmac.compare_digest(incoming_url_expected, signature.lower())
+        reason = 'configured_webhook_url_mismatch' if incoming_url_signature_matches else 'signature_mismatch'
+        reject_auth(
+            reason,
+            webhook_url_matches_request=secrets.compare_digest(URL, incoming_url),
+            incoming_url_signature_matches=incoming_url_signature_matches,
+            possible_causes=(
+                ['configured_webhook_url_mismatch']
+                if incoming_url_signature_matches
+                else ['signing_secret_mismatch', 'registered_url_mismatch', 'sender_signing_input_mismatch']
+            ),
+        )
+    log_webhook('info', 'signature_verified', signature_version=version, body_length=len(body))
+
     if not re.fullmatch(r'[0-9a-f]{64}', delivery):
+        log_webhook(
+            'warning', 'delivery_rejected', reason='invalid_delivery_id',
+            delivery_id_present=bool(delivery), delivery_id_length=len(delivery),
+        )
         raise HTTPException(400, 'Invalid delivery ID')
     try:
         payload = json.loads(body)
@@ -99,12 +179,16 @@ async def receive(request: Request):
             raise ValueError()
         host = urlsplit(source).hostname
     except (ValueError, KeyError, TypeError, AttributeError):
+        log_webhook('warning', 'payload_parsing_failed', reason='invalid_payload')
         raise HTTPException(400, 'Invalid payload')
+    log_webhook('info', 'payload_parsed', event_name='leads', activity_type=activity)
     # Discard clearly unrelated hosts and anonymous non-capture activity.
     # Keep missing/relative source URLs for diagnosis.
     if host and host.lower() not in HOSTS:
+        log_webhook('info', 'event_ignored', reason='other_host')
         return {'status': 'ignored', 'reason': 'other_host'}
     if activity not in CAPTURE and not (data.get('leadId') or data.get('leadEmail')):
+        log_webhook('info', 'event_ignored', reason='anonymous_activity', activity_type=activity)
         return {'status': 'ignored', 'reason': 'anonymous_activity'}
     # Atomic insert + commit is all processing; acknowledge only after commit.
     try:
@@ -114,8 +198,14 @@ async def receive(request: Request):
         with engine.connect() as conn:
             existing = conn.execute(select(events.c.delivery_id).where(events.c.delivery_id == delivery)).first()
         if not existing:
+            log_webhook('error', 'database_insert_failed', reason='integrity_error_not_duplicate')
             raise
+        log_webhook('info', 'duplicate_event_detected', delivery_id_length=len(delivery))
         return {'status': 'duplicate'}
+    except Exception:
+        log_webhook('error', 'database_insert_failed', reason='unexpected_database_error')
+        raise
+    log_webhook('info', 'database_inserted', status='stored')
     return {'status': 'stored'}
 
 @app.get('/api/events', dependencies=[Depends(auth)])

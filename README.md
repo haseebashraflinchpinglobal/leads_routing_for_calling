@@ -35,3 +35,21 @@ uvicorn app:app --reload
 python -m pytest -q
 ```
 Tests simulate LP signatures using local SQLite. Production PostgreSQL and live webhook deliveries are not tested by these tests. The receiver requires signed requests and a timestamp within five minutes. See https://docs.luxurypresence.com/reference/webhookcontroller_createwebhook for the signature and retry contract.
+
+## Synthetic deployed-endpoint diagnostic
+This sends a clearly labelled synthetic event, not a genuine LP event. It uses
+the exact production signing inputs but does not prove that the LP subscription
+has the same URL and secret. Run it only from a trusted terminal; do not put the
+secret in shell history or source control.
+
+```bash
+read -rsp 'Webhook signing secret (same as Render): ' LP_WEBHOOK_SECRET; echo; export LP_WEBHOOK_SECRET
+export LP_WEBHOOK_URL='https://leads-routing-for-calling.onrender.com/webhooks/lp'
+python send_synthetic_webhook.py
+```
+
+The response should be `HTTP 200 {"status":"stored"}` and the dashboard row is
+labelled `SYNTHETIC WEBHOOK DIAGNOSTIC`. Render logs contain authentication,
+parsing and insertion status but never the secret, complete signature, delivery
+ID, or payload. A successful synthetic request verifies the deployed receiver's
+configured URL and secret; it does not verify LP's stored subscription values.
